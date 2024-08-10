@@ -73,12 +73,13 @@ scaler, ort_session = load_model_and_scaler()
 
 
 
-class ProducerUpdate:
+class ProducerUpdateNoCopy:
 
     def __init__(self, dataPath: str, numThreads: int = 0):
         self.start_time_stamp = datetime.now()
         self.queue = queue.Queue()
-        self.suspected_fall_queue = queue.Queue(maxsize=2048)
+        # self.suspected_fall_queue = queue.Queue(maxsize=2048)
+        self.suspected_fall_queue = deque(maxlen=2048)
         # self.ml_result_list = []
         # self.bed_result_list = []
         self.ml_result_list = deque(maxlen=5120)  # Use deque for memory efficiency
@@ -388,37 +389,33 @@ class ProducerUpdate:
         RDM_vector = []
         dates = []
 
-        for i in range(0, len(ml_rdm_queue_list)):
+        for i in range(len(ml_rdm_queue_list)):
             tmp_rdm = ml_rdm_queue_list[i]
             dates.append(ml_rdm_queue_date[i].split('ml_')[1].split('.pickle.bz2')[0])
-            New_rng = (tmp_rdm[:, self.vel_itemindex_ml])
-            RDM = abs(New_rng.reshape(New_rng.shape[0], New_rng.shape[2])) + 0
+            New_rng = tmp_rdm[:, self.vel_itemindex_ml]
+            RDM = abs(New_rng.reshape(New_rng.shape[0], New_rng.shape[2]))
+
             if count_step_time == step_time:
-                # output = self.Model_Test(RDM_vector)
                 output = self.model_test(RDM_vector)
                 count_step_time = 0
-                del RDM_vector[:]
+                RDM_vector.clear()  # Clear instead of del to avoid unnecessary memory reallocation
             else:
                 count_step_time += 1
-                vector_tmp = RDM.reshape(RDM.shape[0] * RDM.shape[1])
-                RDM_vector.append((vector_tmp))
+                vector_tmp = RDM.reshape(-1)
+                RDM_vector.append(vector_tmp)
 
         if output == 'Moving':
-            logging.info(dates[-1] + " >>>>>>ML " + output)
+            logging.info(f"{dates[-1]} >>>>>> ML {output}")
 
         for date in dates:
             if date:
                 self.insert_into_ml_result_list({'date': date, 'output': output})
 
-        del dates[:]
-
         if len(self.ml_result_list) >= 5120:
             self.remove_from_ml_result_list()
-            threading.Thread(
-                name="garbage" + '_' + str(self.gbc),
-                target=self.gc_collect
-            ).start()
-            self.gbc += 1
+            self.thread_pool.submit(self.gc_collect)  # Submit to thread pool for garbage collection
+
+        dates.clear()  # Clear dates list
 
         return
 
@@ -427,13 +424,13 @@ class ProducerUpdate:
         first_run = True
         count_vel_thereshold = int(count_vel)
 
-        for i in range(0, len(fall_rdm_queue_list)):
+        for i in range(len(fall_rdm_queue_list)):
             if first_run:
                 first_run = False
                 count_vel = 0
                 det_count = 0
                 abnorm_count = 0
-                vel_old = (np.ones((self.numchirps * 2, 1), dtype=complex)) * (np.random.rand((self.numchirps * 2)))
+                vel_old = (np.ones((self.numchirps * 2, 1), dtype=complex)) * np.random.rand(self.numchirps * 2)
                 vel_filt_old = vel_old[self.vel_itemindex_fall]
                 vel_point_filt = self.vel_point[self.vel_itemindex_fall]
                 RngDopp_sum = np.zeros((int(self.chirpsamples / 2), self.numchirps * 2), dtype=complex)
@@ -442,33 +439,32 @@ class ProducerUpdate:
             date = fall_rdm_queue_date[i].split('fall_')[1].split('.pickle.bz2')[0]
 
             if count_vel == count_vel_thereshold - 1:
-                RngDopp_sum = fft_2 + RngDopp_sum
-                vel_sum = ((np.abs(RngDopp_sum)).sum(axis=0)) + 0
+                RngDopp_sum += fft_2
+                vel_sum = np.abs(RngDopp_sum).sum(axis=0)
                 vel_filt = vel_sum[self.vel_itemindex_fall]
-                corr_fall, _ = pearsonr(abs(vel_filt), abs(vel_filt_old))
+                corr_fall, _ = pearsonr(np.abs(vel_filt), np.abs(vel_filt_old))
 
                 if corr_fall > 0.5:
-                    ng = 4
-                    nt = 8
+                    ng, nt = 4, 8
                     det_vel_sum = self.SO_CFAR(vel_filt, ng, nt)
                     ind_CFAR_vel = np.argwhere(det_vel_sum == 1)
-                    det_vel = (np.abs(vel_point_filt[ind_CFAR_vel]))
-                    filtind_2 = (np.argwhere(det_vel < 2.8))
+                    det_vel = np.abs(vel_point_filt[ind_CFAR_vel])
+                    filtind_2 = np.argwhere(det_vel < 2.8)
                     if len(filtind_2) > 0:
                         abnorm_count += 1
 
-                vel_filt_old = vel_filt + 0
+                vel_filt_old = vel_filt  # In-place assignment
                 count_vel = 0
                 det_count += 1
-                RngDopp_sum = np.zeros((int(self.chirpsamples / 2), self.numchirps * 2), dtype=complex)
+                RngDopp_sum.fill(0)  # Reset to zero
             else:
                 count_vel += 1
-                RngDopp_sum = fft_2 + RngDopp_sum
+                RngDopp_sum += fft_2
 
             if det_count == det_count_thereshold:
                 if abnorm_count > 1:
-                    self.suspected_fall_queue.put(str(date))
-                    logging.info(date + " >>>>>> suspected fall")
+                    self.suspected_fall_queue.append(date)  # Use append on deque
+                    logging.info(f"{date} >>>>>> suspected fall")
                 abnorm_count = 0
                 det_count = 0
 
@@ -486,9 +482,9 @@ class ProducerUpdate:
     @profile(stream=open('mp_run_move.log', 'w+'))
     def run_signal_processing_move(self, count_move, det_count_thereshold, move_rdm_queue_list, function_name, move_rdm_queue_date):
         first_run = True
-        det_count_thereshold = 50
-        count_move_thereshold = int(count_move)
-        for i in range(0, len(move_rdm_queue_list)):
+        count_vel_thereshold = int(count_move)
+
+        for i in range(len(move_rdm_queue_list)):
             if first_run:
                 first_run = False
                 count_vel = 0
@@ -497,36 +493,34 @@ class ProducerUpdate:
 
             date = move_rdm_queue_date[i].split('move_')[1].split('.pickle.bz2')[0]
             fft_2 = move_rdm_queue_list[i]
-            RngDopp_sum = fft_2 + 0
+            RngDopp_sum = fft_2
 
-            if count_vel == count_move_thereshold - 1:
-                RngDopp_sum = fft_2 + RngDopp_sum
-                vel_sum = ((np.abs(RngDopp_sum)).sum(axis=0)) + 0
+            if count_vel == count_vel_thereshold - 1:
+                RngDopp_sum += fft_2
+                vel_sum = np.abs(RngDopp_sum).sum(axis=0)
                 vel_filt = vel_sum[self.vel_itemindex_move]
-                corr_move, _ = pearsonr(abs(vel_filt), abs(vel_filt_old))
+                corr_move, _ = pearsonr(np.abs(vel_filt), np.abs(vel_filt_old))
 
                 if corr_move > 0.5:
-                    ng = 4
-                    nt = 8
+                    ng, nt = 4, 8
                     det_vel_sum = self.SO_CFAR(vel_filt, ng, nt)
                     ind_CFAR_vel = np.argwhere(det_vel_sum == 1)
-                    det_vel = (np.abs(vel_point_filt[ind_CFAR_vel]))
-                    filtind_2 = (np.argwhere(det_vel < 2.8))
+                    det_vel = np.abs(vel_point_filt[ind_CFAR_vel])
+                    filtind_2 = np.argwhere(det_vel < 2.8)
                     if len(filtind_2) > 0:
                         self.move_Cnt += 1
 
-                vel_filt_old = vel_filt + 0
+                vel_filt_old = vel_filt  # In-place assignment
                 count_vel = 0
                 self.mv_det_count += 1
-                RngDopp_sum = np.zeros((int(self.chirpsamples / 2), self.numchirps * 2), dtype=complex)
+                RngDopp_sum.fill(0)  # Reset to zero
             else:
                 count_vel += 1
-                RngDopp_sum = fft_2 + RngDopp_sum
+                RngDopp_sum += fft_2
 
-        del move_rdm_queue_list[:]
         if self.mv_det_count == det_count_thereshold:
             if self.In_bed and self.move_Cnt > 5 and self.Bed_Cnt > 3:
-                logging.info(date + " >>>>>>>> Bed movement is detected")
+                logging.info(f"{date} >>>>>>>> Bed movement is detected")
             self.mv_det_count = 0
             self.move_Cnt = 0
 
@@ -535,8 +529,8 @@ class ProducerUpdate:
     @profile(stream=open('mp_final_fall.log', 'w+'))
     def final_decision_for_fall(self, start_date):
         while True:
-            if not self.suspected_fall_queue.empty():
-                date = self.suspected_fall_queue.get()
+            if self.suspected_fall_queue:
+                date = self.suspected_fall_queue.popleft()
                 final_decision = False
 
                 while not final_decision:
@@ -560,7 +554,7 @@ class ProducerUpdate:
                                                 if walking_counter == 1 and not self.In_bed:
                                                     if index_bed_sfd is not None:
                                                         final_decision = True
-                                                        logging.info(date + " >>>>>>  Suspected Fall Approved")
+                                                        logging.info(f"{date} >>>>>> Suspected Fall Approved")
                                                         break
                                                     else:
                                                         time.sleep(0.01)
@@ -572,12 +566,13 @@ class ProducerUpdate:
                                 else:
                                     final_decision = True
                                     break
-                        except:
+                        except IndexError:
                             time.sleep(0.01)
                     else:
                         time.sleep(0.01)
             else:
                 time.sleep(0.1)
+
         return
 
     def find_bed_result_list_index(self, date):
