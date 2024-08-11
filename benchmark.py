@@ -1,4 +1,5 @@
 from src.processing.ProducerUpdate import ProducerUpdate
+from src.processing.ProducerUpdateNoCopy import ProducerUpdateNoCopy
 import threading
 # DATA_FILE_PATH="/home/h3trinh/2022-08-27/0x/*.pickle"
 DATA_FILE_PATH="/home/j63chow/data/*.pickle"
@@ -7,7 +8,8 @@ DATA_FILE_PATH="/home/j63chow/data/*.pickle"
 def main():
     # producer = ProducerDequeue(dataPath=DATA_FILE_PATH)
     # producer = ProcedureSingleTF(dataPath=DATA_FILE_PATH)
-    producer = ProducerUpdate(dataPath=DATA_FILE_PATH)
+    # producer = ProducerUpdate(dataPath=DATA_FILE_PATH)
+    producer = ProducerUpdateNoCopy(dataPath=DATA_FILE_PATH)
     # producer = ProducerFirst(dataPath=DATA_FILE_PATH)
     # Spawn thread to run producer.run()
 
