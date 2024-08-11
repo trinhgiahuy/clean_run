@@ -79,11 +79,15 @@ class ProducerUpdateNoCopy:
         self.start_time_stamp = datetime.now()
         self.queue = queue.Queue()
         # self.suspected_fall_queue = queue.Queue(maxsize=2048)
-        self.suspected_fall_queue = deque(maxlen=2048)
+        self.suspected_fall_queue = deque()
+        self.suspected_fall_queue_lock = threading.Lock()
         # self.ml_result_list = []
         # self.bed_result_list = []
-        self.ml_result_list = deque(maxlen=5120)  # Use deque for memory efficiency
-        self.bed_result_list = deque(maxlen=20)   # Smaller deque for bed result
+        self.ml_result_list = deque()  # Use deque for memory efficiency
+        self.ml_result_list_lock = threading.Lock()
+        # self.lock = threading.Lock() 
+
+        self.bed_result_list = deque()   # Smaller deque for bed result
         self.In_bed = False
 
         self.dataPath = dataPath
@@ -101,7 +105,7 @@ class ProducerUpdateNoCopy:
         self.unzip_event = threading.Event()
 
         # Use ThreadPoolExecutor instead of creating new threads
-        self.thread_pool = ThreadPoolExecutor(max_workers=4)
+        self.thread_pool = ThreadPoolExecutor(max_workers=20)
 
         self.unzip_thread = threading.Thread(target=self.unzip_files)
         self.unzip_thread.start()
@@ -404,20 +408,32 @@ class ProducerUpdateNoCopy:
                 vector_tmp = RDM.reshape(-1)
                 RDM_vector.append(vector_tmp)
 
-        if output == 'Moving':
-            logging.info(f"{dates[-1]} >>>>>> ML {output}")
+        # if output == 'Moving':
+        #     logging.info(f"{dates[-1]} >>>>>> ML {output}")
 
         for date in dates:
             if date:
                 self.insert_into_ml_result_list({'date': date, 'output': output})
 
         if len(self.ml_result_list) >= 5120:
+            # print(f"[DEBUG] List size before trimming: {len(self.ml_result_list)}")
             self.remove_from_ml_result_list()
-            self.thread_pool.submit(self.gc_collect)  # Submit to thread pool for garbage collection
+            self.thread_pool.submit(self.gc_collect)
 
         dates.clear()  # Clear dates list
 
         return
+    
+    def remove_from_ml_result_list(self):
+        with self.ml_result_list_lock:
+            # Calculate the midpoint
+            mid_index = len(self.ml_result_list) // 2
+            
+            # Convert deque to list, slice, and convert back to deque
+            self.ml_result_list = deque(list(self.ml_result_list)[mid_index:])
+            
+            print(f"[DEBUG] After trim: size = {len(self.ml_result_list)}")
+
 
     @profile(stream=open('mp_run_fall.log', 'w+'))
     def run_signal_processing_fall_detection(self, count_vel, det_count_thereshold, fall_rdm_queue_list, fall_rdm_queue_date):
@@ -470,18 +486,26 @@ class ProducerUpdateNoCopy:
 
         return
 
-    def remove_from_ml_result_list(self):
-        self.ml_result_list = self.ml_result_list[len(self.ml_result_list) // 2:]
-        gc.collect()
-        return
+    # def remove_from_ml_result_list(self):
+    #     with self.ml_result_list_lock:
+    #         # Remove half of the list to keep the size in check
+    #         removal_size = len(self.ml_result_list) // 2
+    #         self.ml_result_list = self.ml_result_list[removal_size:]
+    #         print("Reduced ml_result_list size to {len(self.ml_result_list)}")
+    #     gc.collect()  # Explicit garbage collection to free memory
+    #     print("Reduced ml_result_list size to {len(self.ml_result_list)}")
+
 
     def gc_collect(self):
         gc.collect()
-        return
+        print("[DEBUG] Garbage collected.")
+
+        # return
 
     @profile(stream=open('mp_run_move.log', 'w+'))
     def run_signal_processing_move(self, count_move, det_count_thereshold, move_rdm_queue_list, function_name, move_rdm_queue_date):
         first_run = True
+        det_count_thereshold = 50
         count_vel_thereshold = int(count_move)
 
         for i in range(len(move_rdm_queue_list)):
@@ -530,6 +554,7 @@ class ProducerUpdateNoCopy:
     def final_decision_for_fall(self, start_date):
         while True:
             if self.suspected_fall_queue:
+                print(f"****len(suspected_fall_queue):{len(self.suspected_fall_queue)}")
                 date = self.suspected_fall_queue.popleft()
                 final_decision = False
 
@@ -848,7 +873,9 @@ class ProducerUpdateNoCopy:
 
         return
 
+    # TODO: Add threading lock here like insert_into_ml_result_list
     def insert_into_bed_result_list(self, dict):
+        print(f"__Call insert_into_bed_result_list with len {len(self.bed_result_list)}")
         index = len(self.bed_result_list)
         for i, entry in enumerate(self.bed_result_list):
             if entry['date'] > dict['date']:
@@ -955,26 +982,35 @@ class ProducerUpdateNoCopy:
 
         return self.bed_points
 
-    def insert_into_ml_result_list(self, dict):
-        """
-        ################################################################### 8. UPDATED TO USE ENUMERATE
-        Insert data into the machine learning result list.
+    # def insert_into_ml_result_list(self, dict):
+    #     print(f"Call insert_into_ml_result_list....size now {len(self.ml_result_list)}")
 
-        Args:
-            data_dict (dict): Dictionary containing data to be inserted.
+    #     """
+    #     ################################################################### 8. UPDATED TO USE ENUMERATE
+    #     Insert data into the machine learning result list.
 
-        Returns:
-            list: Updated machine learning result list.
-        """
-        index = len(self.ml_result_list)
+    #     Args:
+    #         data_dict (dict): Dictionary containing data to be inserted.
 
-        for i, entry in enumerate(self.ml_result_list):
-            if entry['date'] > dict['date']:
-                index = i
-                break
+    #     Returns:
+    #         list: Updated machine learning result list.
+    #     """
+    #     with self.ml_result_list_lock:
+    #         index = len(self.ml_result_list)
 
-        self.ml_result_list.insert(index, (dict))
-        return self.ml_result_list
+    #         for i, entry in enumerate(self.ml_result_list):
+    #             if entry['date'] > dict['date']:
+    #                 index = i
+    #                 break
+
+    #         self.ml_result_list.insert(index, (dict))
+    #         # return self.ml_result_list
+
+    def insert_into_ml_result_list(self, data_dict):
+        with self.ml_result_list_lock:
+            # print(f"[DEBUG] Before insert: size = {len(self.ml_result_list)}")
+            self.ml_result_list.append(data_dict)
+            print(f"[DEBUG] After insert: size = {len(self.ml_result_list)}")
 
     def cfar_2d(self, signal_matrix, guard_cells, training_cells, threshold_factor):
         '''
